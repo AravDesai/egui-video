@@ -1438,7 +1438,7 @@ impl Streamer for VideoStreamer {
             frame.format(),
             frame.width(),
             frame.height(),
-            Pixel::RGB24,
+            Pixel::RGBA,
             frame.width(),
             frame.height(),
             Flags::BILINEAR,
@@ -1699,19 +1699,17 @@ fn video_frame_to_image(frame: Video) -> ColorImage {
     let size = [frame.width() as usize, frame.height() as usize];
     let data = frame.data(0);
     let stride = frame.stride(0);
-    let pixel_size_bytes = 3;
+    let pixel_size_bytes = 4;
     let byte_width: usize = pixel_size_bytes * frame.width() as usize;
     let height: usize = frame.height() as usize;
     let mut pixels = vec![];
+    pixels.reserve(size[0] * size[1]);
     for line in 0..height {
         let begin = line * stride;
         let end = begin + byte_width;
         let data_line = &data[begin..end];
-        pixels.extend(
-            data_line
-                .chunks_exact(pixel_size_bytes)
-                .map(|p| Color32::from_rgb(p[0], p[1], p[2])),
-        )
+        let pixel_line: &[Color32] = bytemuck::cast_slice(data_line);
+        pixels.extend_from_slice(pixel_line);
     }
     ColorImage { size, pixels }
 }
