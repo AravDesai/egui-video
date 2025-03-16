@@ -222,9 +222,11 @@ pub struct Player {
     message_reciever: PlayerMessageReciever,
     video_timer: Timer,
     audio_timer: Timer,
+    synchro_timer: Timer,
     subtitle_timer: Timer,
     audio_thread: Option<Guard>,
     video_thread: Option<Guard>,
+    synchro_thread: Option<Guard>,
     subtitle_thread: Option<Guard>,
     ctx_ref: egui::Context,
     last_seek_ms: Option<i64>,
@@ -240,7 +242,6 @@ pub struct Player {
     subtitles_queue: SubtitleQueue,
     current_subtitles: Vec<Subtitle>,
     input_path: String,
-    current_set_pts: i64,
 }
 
 /// The possible states of a [`Player`].
@@ -273,7 +274,7 @@ pub struct VideoStreamer {
     video_elapsed_ms: Shared<i64>,
     _audio_elapsed_ms: Shared<i64>,
     apply_video_frame_fn: Option<ApplyVideoFrameFn>,
-    frame_cache: Vec<(<VideoStreamer as Streamer>::ProcessedFrame, i64, i64)>,
+    frame_cache: VecDeque<(<VideoStreamer as Streamer>::ProcessedFrame, i64, i64)>,
 }
 
 /// Streams audio.
@@ -434,25 +435,29 @@ impl Player {
         let mut texture_handle = self.texture_handle.clone();
         let texture_options = self.options.texture_options;
         let ctx = self.ctx_ref.clone();
-        let wait_duration = Duration::milliseconds((1000. / self.framerate) as i64);
+        let nanos = 1e9 / self.framerate;
+        let wait_duration = Duration::nanoseconds(nanos as i64);
 
-        fn play<T: Streamer>(streamer: &Weak<Mutex<T>>) {
+        fn play<T: Streamer>(streamer: &Weak<Mutex<T>>) -> bool {
             if let Some(streamer) = streamer.upgrade() {
                 if let Some(mut streamer) = streamer.try_lock() {
                     if (streamer.player_state().get() == PlayerState::Playing)
                         && streamer.primary_elapsed_ms().get() >= streamer.elapsed_ms().get()
                     {
                         match streamer.recieve_next_packet_until_frame() {
-                            Ok(frame) => streamer.apply_frame(frame),
+                            Ok(frame) => {
+                                return streamer.apply_frame(frame);
+                            },
                             Err(e) => {
                                 if is_ffmpeg_eof_error(&e) && streamer.is_primary_streamer() {
-                                    streamer.player_state().set(PlayerState::EndOfFile)
+                                    streamer.player_state().set(PlayerState::EndOfFile);
                                 }
                             }
                         }
                     }
                 }
             }
+            return false;
         }
 
         self.video_streamer.lock().apply_video_frame_fn = Some(Box::new(move |frame| {
@@ -461,9 +466,11 @@ impl Player {
 
         let video_streamer_ref = Arc::downgrade(&self.video_streamer);
 
-        let video_timer_guard = self.video_timer.schedule_repeating(wait_duration, move || {
-            play(&video_streamer_ref);
-            ctx.request_repaint();
+        let video_timer_guard = self.video_timer.schedule_repeating(Duration::zero(), move || {
+            let sleep = play(&video_streamer_ref);
+            if sleep {
+                std::thread::sleep(core::time::Duration::from_nanos(nanos as u64));
+            }
         });
 
         self.video_thread = Some(video_timer_guard);
@@ -472,7 +479,9 @@ impl Player {
             let audio_decoder_ref = Arc::downgrade(audio_decoder);
             let audio_timer_guard = self
                 .audio_timer
-                .schedule_repeating(Duration::zero(), move || play(&audio_decoder_ref));
+                .schedule_repeating(Duration::zero(), move || {
+                    play(&audio_decoder_ref);
+                });
             self.audio_thread = Some(audio_timer_guard);
         }
 
@@ -480,9 +489,17 @@ impl Player {
             let subtitle_decoder_ref = Arc::downgrade(subtitle_decoder);
             let subtitle_timer_guard = self
                 .subtitle_timer
-                .schedule_repeating(wait_duration, move || play(&subtitle_decoder_ref));
+                .schedule_repeating(Duration::zero(), move || {
+                    play(&subtitle_decoder_ref);
+                });
             self.subtitle_thread = Some(subtitle_timer_guard);
         }
+
+        // have a general timer to repaint egui that doesn't have to wait for ffmpeg
+        let synchro_timer_guard = self.synchro_timer.schedule_repeating(wait_duration, move || {
+            ctx.request_repaint();
+        });
+        self.synchro_thread = Some(synchro_timer_guard);
     }
     /// Start the stream.
     pub fn start(&mut self) {
@@ -574,27 +591,32 @@ impl Player {
     /// Create the [`egui::Image`] for the video frame.
     pub fn generate_frame_image(&mut self, size: Vec2) -> Image {
         let mut vs = self.video_streamer.lock();
-        let frame_cache: &mut Vec<(ColorImage, i64, i64)> = vs.frame_cache.as_mut();
+        let frame_cache: &mut VecDeque<(ColorImage, i64, i64)> = &mut vs.frame_cache;
+
+        let mut found = false;
 
         // get the closest
         let mut closest = 0;
-        let mut smallest_diff = std::i64::MAX;
         let dtime = self.audio_device_time_ms.get();
         for (i, frame) in frame_cache.iter().enumerate() {
-            let diff = (frame.1 - dtime).abs();
-            if diff < smallest_diff {
+            if i >= frame_cache.len() - 1 {
+                continue;
+            }
+            if dtime >= frame.1 && dtime < frame_cache[i + 1].1 {
                 closest = i;
-                smallest_diff = diff;
+                found = true;
+                break;
             }
         }
-        // remove any frames that are before the closest
+        // remove any frames that are before the closest (if needed)
         if closest > 0 {
             frame_cache.drain(0..closest);
         }
 
-        if !frame_cache.is_empty() && self.current_set_pts != frame_cache.first().unwrap().1 {
+        if !frame_cache.is_empty() && found {
+            let frame = frame_cache.pop_front().unwrap().0;
             let texture_options = self.options.texture_options;
-            self.texture_handle.set(frame_cache.first().unwrap().0.clone(), texture_options)
+            self.texture_handle.set(frame, texture_options);
         }
 
         Image::new(SizedTexture::new(self.texture_handle.id(), size)).sense(Sense::click())
@@ -1242,7 +1264,7 @@ impl Player {
             video_elapsed_ms: video_elapsed_ms.clone(),
             input_context,
             player_state: player_state.clone(),
-            frame_cache: Vec::<(ColorImage, i64, i64)>::default(),
+            frame_cache: VecDeque::<(ColorImage, i64, i64)>::default(),
         };
         let options = PlayerOptions::default();
         let texture_handle =
@@ -1258,11 +1280,13 @@ impl Player {
             framerate,
             video_timer: Timer::new(),
             audio_timer: Timer::new(),
+            synchro_timer: Timer::new(),
             subtitle_timer: Timer::new(),
             subtitle_elapsed_ms: Shared::new(0),
             preseek_player_state: None,
             video_thread: None,
             subtitle_thread: None,
+            synchro_thread: None,
             audio_thread: None,
             texture_handle,
             player_state,
@@ -1282,7 +1306,6 @@ impl Player {
             current_subtitles: Vec::new(),
             #[cfg(feature = "from_bytes")]
             temp_file: None,
-            current_set_pts: i64::MAX,
         };
 
         loop {
@@ -1435,7 +1458,7 @@ pub trait Streamer: Send {
                 // frame preview
                 if self.is_primary_streamer() {
                     if let Ok(frame) = self.recieve_next_packet_until_frame() {
-                        self.apply_frame(frame)
+                        self.apply_frame(frame);
                     }
                 }
             }
@@ -1523,7 +1546,7 @@ pub trait Streamer: Send {
     /// Process a decoded frame.
     fn process_frame(&mut self, frame: Self::Frame) -> Result<(Self::ProcessedFrame, i64, i64)>;
     /// Apply a processed frame
-    fn apply_frame(&mut self, _frame: (Self::ProcessedFrame, i64, i64)) {}
+    fn apply_frame(&mut self, _frame: (Self::ProcessedFrame, i64, i64)) -> bool { return false; }
     /// Decode and process a frame.
     fn recieve_next_frame(&mut self) -> Result<(Self::ProcessedFrame, i64, i64)> {
         match self.decode_frame() {
@@ -1571,13 +1594,13 @@ impl Streamer for VideoStreamer {
         self.video_decoder.receive_frame(&mut decoded_frame)?;
         Ok(decoded_frame)
     }
-    fn apply_frame(&mut self, frame: (Self::ProcessedFrame, i64, i64)) {
+    fn apply_frame(&mut self, frame: (Self::ProcessedFrame, i64, i64)) -> bool {
         // some logic here to deal with synchronization
         // store all frames in the cache, display current frame until audio device is more near a future frame
-        self.frame_cache.push(frame);
-        // if let Some(apply_video_frame_fn) = self.apply_video_frame_fn.as_mut() {
-        //     apply_video_frame_fn(self.frame_cache.first().as_ref().unwrap().0.clone())
-        // }
+        self.frame_cache.push_back(frame);
+
+        // full after like 50 frames
+        self.frame_cache.len() >= 50
     }
     fn process_frame(&mut self, frame: Self::Frame) -> Result<(Self::ProcessedFrame, i64, i64)> {
         let mut rgb_frame = Video::empty();
@@ -1763,9 +1786,12 @@ impl Streamer for SubtitleStreamer {
             anyhow::bail!("no subtitle")
         }
     }
-    fn apply_frame(&mut self, frame: (Self::ProcessedFrame, i64, i64)) {
+    fn apply_frame(&mut self, frame: (Self::ProcessedFrame, i64, i64)) -> bool {
         let mut queue = self.subtitles_queue.lock();
-        queue.push_back(frame.0)
+        queue.push_back(frame.0);
+
+        // parse as fast as possible
+        false
     }
 }
 
@@ -1860,7 +1886,7 @@ impl AudioDeviceCallback {
             for stream in self.sample_streams.iter() {
                 // clear until there's nothing left
                 while let Ok(_) = stream.sample_consumer.try_recv() {
-                    println!("draining audio receiver...");
+                    //println!("draining audio receiver...");
                 }
             }
             self.seeking.as_ref().unwrap().set(false);
