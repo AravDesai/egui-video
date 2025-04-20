@@ -16,6 +16,7 @@ use egui::emath::RectTransform;
 use egui::epaint::Shadow;
 use egui::load::SizedTexture;
 
+use cpal::traits::StreamTrait;
 use egui::{
     vec2, Align2, Color32, ColorImage, CornerRadius, FontId, Image, Pos2, Rect, Response, Sense,
     Spinner, TextureHandle, TextureOptions, Ui, Vec2,
@@ -31,14 +32,13 @@ use ffmpeg::util::frame::video::Video;
 use ffmpeg::{rescale, Packet, Rational, Rescale};
 use ffmpeg::{software, ChannelLayout};
 use parking_lot::Mutex;
-use cpal::traits::StreamTrait;
 use std::collections::VecDeque;
 use std::ops::Deref;
+use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use std::time::UNIX_EPOCH;
 use subtitle::Subtitle;
 use timer::{Guard, Timer};
-use std::sync::mpsc;
 
 mod subtitle;
 
@@ -80,7 +80,11 @@ impl CpalAudioDevice {
         let _ = self.stream.play();
     }
 
-    fn run<T>(callback: Arc<Mutex<AudioDeviceCallback>>, device: &cpal::Device, config: &cpal::StreamConfig) -> Result<cpal::Stream, BuildStreamError>
+    fn run<T>(
+        callback: Arc<Mutex<AudioDeviceCallback>>,
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+    ) -> Result<cpal::Stream, BuildStreamError>
     where
         T: cpal::SizedSample + cpal::FromSample<f32> + std::iter::Sum<f32>,
     {
@@ -91,7 +95,7 @@ impl CpalAudioDevice {
                 Self::write_data(callback.clone(), data)
             },
             err_fn,
-            None
+            None,
         )
     }
 
@@ -114,7 +118,8 @@ impl CpalAudioDevice {
         let stream = match sample_format {
             cpal::SampleFormat::F32 => Self::run::<f32>(callback.clone(), &device, config_uw),
             sample_format => panic!("Unsupported sample format '{sample_format}'"),
-        }.unwrap();
+        }
+        .unwrap();
         CpalAudioDevice {
             sample_format,
             sample_rate,
@@ -447,7 +452,7 @@ impl Player {
                         match streamer.recieve_next_packet_until_frame() {
                             Ok(frame) => {
                                 return streamer.apply_frame(frame);
-                            },
+                            }
                             Err(e) => {
                                 if is_ffmpeg_eof_error(&e) && streamer.is_primary_streamer() {
                                     streamer.player_state().set(PlayerState::EndOfFile);
@@ -466,39 +471,43 @@ impl Player {
 
         let video_streamer_ref = Arc::downgrade(&self.video_streamer);
 
-        let video_timer_guard = self.video_timer.schedule_repeating(Duration::zero(), move || {
-            let sleep = play(&video_streamer_ref);
-            if sleep {
-                std::thread::sleep(core::time::Duration::from_nanos(nanos as u64));
-            }
-        });
+        let video_timer_guard = self
+            .video_timer
+            .schedule_repeating(Duration::zero(), move || {
+                let sleep = play(&video_streamer_ref);
+                if sleep {
+                    std::thread::sleep(core::time::Duration::from_nanos(nanos as u64));
+                }
+            });
 
         self.video_thread = Some(video_timer_guard);
 
         if let Some(audio_decoder) = self.audio_streamer.as_ref() {
             let audio_decoder_ref = Arc::downgrade(audio_decoder);
-            let audio_timer_guard = self
-                .audio_timer
-                .schedule_repeating(Duration::zero(), move || {
-                    play(&audio_decoder_ref);
-                });
+            let audio_timer_guard =
+                self.audio_timer
+                    .schedule_repeating(Duration::zero(), move || {
+                        play(&audio_decoder_ref);
+                    });
             self.audio_thread = Some(audio_timer_guard);
         }
 
         if let Some(subtitle_decoder) = self.subtitle_streamer.as_ref() {
             let subtitle_decoder_ref = Arc::downgrade(subtitle_decoder);
-            let subtitle_timer_guard = self
-                .subtitle_timer
-                .schedule_repeating(Duration::zero(), move || {
-                    play(&subtitle_decoder_ref);
-                });
+            let subtitle_timer_guard =
+                self.subtitle_timer
+                    .schedule_repeating(Duration::zero(), move || {
+                        play(&subtitle_decoder_ref);
+                    });
             self.subtitle_thread = Some(subtitle_timer_guard);
         }
 
         // have a general timer to repaint egui that doesn't have to wait for ffmpeg
-        let synchro_timer_guard = self.synchro_timer.schedule_repeating(wait_duration, move || {
-            ctx.request_repaint();
-        });
+        let synchro_timer_guard = self
+            .synchro_timer
+            .schedule_repeating(wait_duration, move || {
+                ctx.request_repaint();
+            });
         self.synchro_thread = Some(synchro_timer_guard);
     }
     /// Start the stream.
@@ -528,7 +537,8 @@ impl Player {
                 let time = self.audio_device_time_ms.get();
                 for subtitle in self.current_subtitles.iter_mut() {
                     should_cull_overlapping_subs |= subtitle.presentation_time_ms.is_some();
-                    if should_cull_overlapping_subs && time < subtitle.presentation_time_ms.unwrap() {
+                    if should_cull_overlapping_subs && time < subtitle.presentation_time_ms.unwrap()
+                    {
                         continue;
                     }
                     subtitle.showing = true;
@@ -660,7 +670,11 @@ impl Player {
                 let mut image = ColorImage::default();
                 image.size = [subtitle.bitmap.w as usize, subtitle.bitmap.h as usize];
                 image.pixels = subtitle.bitmap.data.clone();
-                subtitle.bitmap.tex_handle = Some(self.ctx_ref.load_texture("subtitle", image, TextureOptions::default()))
+                subtitle.bitmap.tex_handle = Some(self.ctx_ref.load_texture(
+                    "subtitle",
+                    image,
+                    TextureOptions::default(),
+                ))
             }
             let transform = RectTransform::from_to(
                 Rect::from_min_size(Pos2::ZERO, self.size),
@@ -671,14 +685,20 @@ impl Player {
                     continue;
                 }
                 let min = egui::pos2(subtitle.bitmap.x as f32, subtitle.bitmap.y as f32);
-                let max = egui::pos2(min.x + subtitle.bitmap.w as f32, min.y + subtitle.bitmap.h as f32);
+                let max = egui::pos2(
+                    min.x + subtitle.bitmap.w as f32,
+                    min.y + subtitle.bitmap.h as f32,
+                );
 
-                let rect = Rect { min: transform.transform_pos(min), max: transform.transform_pos(max) };
+                let rect = Rect {
+                    min: transform.transform_pos(min),
+                    max: transform.transform_pos(max),
+                };
                 ui.painter().image(
                     subtitle.bitmap.tex_handle.as_ref().unwrap().id(),
                     rect,
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE
+                    Color32::WHITE,
                 );
                 continue;
             }
@@ -1111,7 +1131,8 @@ impl Player {
                 get_decoder_from_stream_index(&audio_input_context, audio_stream_indices[0])?
                     .audio()?;
 
-            let (audio_sample_producer, audio_sample_consumer) = mpsc::channel::<StreamingAudioChunk>();
+            let (audio_sample_producer, audio_sample_consumer) =
+                mpsc::channel::<StreamingAudioChunk>();
             let audio_resampler = ffmpeg::software::resampling::context::Context::get2(
                 audio_decoder.format(),
                 audio_decoder.ch_layout(),
@@ -1131,15 +1152,9 @@ impl Player {
                     chunks: None,
                 });
 
-            audio_device
-                .callback
-                .lock()
-                .device_time_ms = Some(self.audio_device_time_ms.clone());
+            audio_device.callback.lock().device_time_ms = Some(self.audio_device_time_ms.clone());
 
-            audio_device
-                .callback
-                .lock()
-                .seeking = Some(self.seeking_signal.clone());
+            audio_device.callback.lock().seeking = Some(self.seeking_signal.clone());
 
             audio_device.play();
 
@@ -1534,9 +1549,8 @@ pub trait Streamer: Send {
                 Err(e) => {
                     if is_ffmpeg_incomplete_error(&e) {
                         self.recieve_next_packet()?;
-                        continue
-                    }
-                    else {
+                        continue;
+                    } else {
                         return Err(e);
                     }
                 }
@@ -1546,7 +1560,9 @@ pub trait Streamer: Send {
     /// Process a decoded frame.
     fn process_frame(&mut self, frame: Self::Frame) -> Result<(Self::ProcessedFrame, i64, i64)>;
     /// Apply a processed frame
-    fn apply_frame(&mut self, _frame: (Self::ProcessedFrame, i64, i64)) -> bool { return false; }
+    fn apply_frame(&mut self, _frame: (Self::ProcessedFrame, i64, i64)) -> bool {
+        return false;
+    }
     /// Decode and process a frame.
     fn recieve_next_frame(&mut self) -> Result<(Self::ProcessedFrame, i64, i64)> {
         match self.decode_frame() {
@@ -1774,9 +1790,13 @@ impl Streamer for SubtitleStreamer {
         if let Some(rect) = frame.rects().next() {
             Subtitle::from_ffmpeg_rect(rect).map(|s| {
                 if pts.is_some() {
-                    (s.with_presentation_time_ms(pts.unwrap()).with_duration_ms(3000), pts.unwrap(), duration)
-                }
-                else if s.remaining_duration_ms == 0 {
+                    (
+                        s.with_presentation_time_ms(pts.unwrap())
+                            .with_duration_ms(3000),
+                        pts.unwrap(),
+                        duration,
+                    )
+                } else if s.remaining_duration_ms == 0 {
                     (s.with_duration_ms(duration), pts.unwrap(), duration)
                 } else {
                     (s, pts.unwrap(), duration)
@@ -1844,13 +1864,13 @@ impl ChunkSampler {
         if !self.finished() {
             let sample = self.chunk.data[self.processed];
             self.processed += 1;
-            return sample
+            return sample;
         }
-        return 0.0
+        return 0.0;
     }
 
     fn finished(&self) -> bool {
-        return self.processed >= self.chunk.data.len()
+        return self.processed >= self.chunk.data.len();
     }
 }
 
@@ -1870,8 +1890,7 @@ impl AudioSampleStream {
         }
         if self.chunks.is_some() {
             self.chunks.as_mut().unwrap().get_sample()
-        }
-        else {
+        } else {
             0.0
         }
     }
@@ -1901,9 +1920,13 @@ impl AudioDeviceCallback {
                 // figure out where we're starting
                 let base_time = stream.chunks.as_ref().unwrap().chunk.presentation_time_ms as f64;
                 let duration = stream.chunks.as_ref().unwrap().chunk.duration as f64;
-                let frac = stream.chunks.as_ref().unwrap().processed as f64 / stream.chunks.as_ref().unwrap().chunk.data.len() as f64;
+                let frac = stream.chunks.as_ref().unwrap().processed as f64
+                    / stream.chunks.as_ref().unwrap().chunk.data.len() as f64;
                 let current_time = base_time + duration * frac;
-                self.device_time_ms.as_mut().unwrap().set(current_time as i64);
+                self.device_time_ms
+                    .as_mut()
+                    .unwrap()
+                    .set(current_time as i64);
             }
         }
 
@@ -1911,9 +1934,7 @@ impl AudioDeviceCallback {
             *x = self
                 .sample_streams
                 .iter_mut()
-                .map(|s| {
-                    s.get_sample() * s.audio_volume.get()
-                })
+                .map(|s| s.get_sample() * s.audio_volume.get())
                 .sum()
         }
     }
@@ -1973,6 +1994,6 @@ fn video_frame_to_image(frame: Video) -> ColorImage {
         let pixel_line: &[Color32] = bytemuck::cast_slice(data_line);
         pixels.extend_from_slice(pixel_line);
     }
-    
+
     ColorImage { size, pixels }
 }

@@ -1,6 +1,6 @@
 use eframe::NativeOptions;
 use egui::{CentralPanel, DragValue, Grid, Sense, Slider, TextEdit, Window};
-use egui_video::{AudioDevice, Player};
+use egui_video::{CpalAudioDevice, Player};
 fn main() {
     let _ = eframe::run_native(
         "app",
@@ -9,7 +9,7 @@ fn main() {
     );
 }
 struct App {
-    audio_device: AudioDevice,
+    audio_device: CpalAudioDevice,
     player: Option<Player>,
 
     media_path: String,
@@ -20,7 +20,7 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
-            audio_device: AudioDevice::new().unwrap(),
+            audio_device: CpalAudioDevice::new(),
             media_path: String::new(),
             stream_size_scale: 1.,
             seek_frac: 0.,
