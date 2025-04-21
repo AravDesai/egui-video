@@ -174,7 +174,7 @@ pub struct PlayerOptions {
 impl Default for PlayerOptions {
     fn default() -> Self {
         Self {
-            looping: true,
+            looping: false,
             max_audio_volume: 1.,
             audio_volume: Shared::new(0.5),
             texture_options: TextureOptions::default(),
